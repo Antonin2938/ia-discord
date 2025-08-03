@@ -1,0 +1,21 @@
+# Fichier requirements.txt pour le projet AI-Context
+
+# Pour la connexion à Discord en tant que self-bot (versions spécifiques obligatoires)
+discord.py==1.7.3
+aiohttp==3.7.4
+
+# Pour lire les clés API depuis le fichier .env
+python-dotenv
+
+# Pour se connecter à l'API de Google Gemini
+google-generativeai
+
+# Pour comprendre les dates en langage naturel (ex: "hier 15h")
+dateparser
+
+# Pour se connecter à l'API de Perplexity
+openai
+
+# NOUVEAU : Pour lire le contenu des pages web
+requests
+beautifulsoup4
