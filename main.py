@@ -12,8 +12,6 @@ import re
 import sys
 import requests
 from bs4 import BeautifulSoup
-from PIL import Image
-from io import BytesIO
 
 # --- AVERTISSEMENT IMPORTANT ---
 # Ce script est un "self-bot". Son utilisation est une violation des
@@ -27,47 +25,48 @@ DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 GEMINI_API_KEYS = os.getenv('GEMINI_API_KEYS', '')
 PPLX_API_KEY = os.getenv('PPLX_API_KEY')
 OWNER_ID = os.getenv('OWNER_ID')
-WHITELIST_IDS = os.getenv('WHITELIST_IDS', '')
 
 MEMORY_FILE = "memory.txt"
+WHITELIST_FILE = "whitelist.txt"
 convo_mode_users = set()
 
 if not all([DISCORD_TOKEN, GEMINI_API_KEYS, PPLX_API_KEY, OWNER_ID]):
     print("Erreur : Variables d'environnement manquantes.")
     exit()
 
-# --- FONCTIONS POUR GÉRER LE FICHIER .ENV ---
-def update_env_file(key_to_update, new_value):
-    env_lines = []
-    key_found = False
+# --- FONCTIONS POUR GÉRER LA WHITELIST ---
+def read_whitelist():
+    """Lit les ID depuis le fichier whitelist.txt et les retourne sous forme de liste d'entiers."""
     try:
-        with open('.env', 'r', encoding='utf-8') as f:
-            env_lines = f.readlines()
-        with open('.env', 'w', encoding='utf-8') as f:
-            for line in env_lines:
-                if line.strip().startswith(key_to_update):
-                    f.write(f'{key_to_update}="{new_value}"\n')
-                    key_found = True
-                else:
-                    f.write(line)
-            if not key_found:
-                 f.write(f'\n{key_to_update}="{new_value}"\n')
-        return True
-    except Exception as e:
-        print(f"Erreur lors de la mise à jour du fichier .env : {e}")
-        return False
+        with open(WHITELIST_FILE, 'r', encoding='utf-8') as f:
+            return [int(line.strip()) for line in f if line.strip().isdigit()]
+    except FileNotFoundError:
+        with open(WHITELIST_FILE, 'w', encoding='utf-8') as f: pass
+        return []
+
+def add_to_whitelist(user_id):
+    """Ajoute un ID utilisateur au fichier whitelist.txt."""
+    with open(WHITELIST_FILE, 'a', encoding='utf-8') as f:
+        f.write(str(user_id) + "\n")
+
+def remove_from_whitelist(user_id):
+    """Retire un ID utilisateur du fichier whitelist.txt."""
+    current_ids = read_whitelist()
+    new_ids = [uid for uid in current_ids if uid != int(user_id)]
+    with open(WHITELIST_FILE, 'w', encoding='utf-8') as f:
+        for uid in new_ids:
+            f.write(str(uid) + "\n")
 
 # --- PRÉPARATION DES UTILISATEURS AUTORISÉS ---
 authorized_ids = []
 try:
     OWNER_ID_INT = int(OWNER_ID)
     authorized_ids.append(OWNER_ID_INT)
-    if WHITELIST_IDS:
-        whitelisted = [int(user_id) for user_id in WHITELIST_IDS.split(',') if user_id]
-        authorized_ids.extend(whitelisted)
+    authorized_ids.extend(read_whitelist())
+    authorized_ids = list(set(authorized_ids))
     print(f"Utilisateurs autorisés : {authorized_ids}")
 except (ValueError, TypeError):
-    print("Erreur : ID invalide dans le .env.")
+    print("Erreur : OWNER_ID n'est pas un nombre valide.")
     exit()
 
 # --- PRÉPARATION DU POOL DE CLÉS GEMINI ---
@@ -81,20 +80,17 @@ print(f"{len(gemini_keys_list)} clés API Gemini chargées.")
 pplx_client = OpenAI(api_key=PPLX_API_KEY, base_url="https://api.perplexity.ai")
 print("Configuration terminée.")
 
-# --- FONCTIONS UTILITAIRES ---
+# --- FONCTIONS UTILITAIRES (MÉMOIRE, URL) ---
 def read_memory():
     try:
         with open(MEMORY_FILE, 'r', encoding='utf-8') as f: return f.read()
     except FileNotFoundError:
         with open(MEMORY_FILE, 'w', encoding='utf-8') as f: pass
         return ""
-
 def add_to_memory(text):
     with open(MEMORY_FILE, 'a', encoding='utf-8') as f: f.write(text + "\n")
-
 def clear_memory():
     with open(MEMORY_FILE, 'w', encoding='utf-8') as f: pass
-
 def fetch_url_content(url):
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
@@ -103,10 +99,7 @@ def fetch_url_content(url):
         soup = BeautifulSoup(response.content, 'html.parser')
         for script_or_style in soup(['script', 'style']):
             script_or_style.decompose()
-        text = soup.get_text()
-        lines = (line.strip() for line in text.splitlines())
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        text = '\n'.join(chunk for chunk in chunks if chunk)
+        text = '\n'.join(chunk for chunk in (phrase.strip() for line in (line.strip() for line in soup.get_text().splitlines()) for phrase in line.split("  ")) if chunk)
         return text[:15000]
     except requests.RequestException as e:
         print(f"Erreur lors de la récupération de l'URL {url}: {e}")
@@ -130,15 +123,9 @@ async def send_long_message(destination, text, message_to_reply=None):
     first_message = True
     for chunk in chunks:
         try:
-            # En DM, on ne peut pas utiliser "reply", on envoie simplement le message
-            if isinstance(destination, discord.User) and message_to_reply:
-                message_to_reply = None
-
-            if first_message and message_to_reply:
-                await message_to_reply.reply(chunk)
-                first_message = False
-            else:
-                await destination.send(chunk)
+            if isinstance(destination, discord.User) and message_to_reply: message_to_reply = None
+            if first_message and message_to_reply: await message_to_reply.reply(chunk); first_message = False
+            else: await destination.send(chunk)
         except discord.errors.Forbidden: break
 
 @client.event
@@ -150,27 +137,19 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
-    # --- FILTRES DE DÉCLENCHEMENT ---
-    # 1. Ignorer ses propres messages et ceux des utilisateurs non autorisés
-    if message.author == client.user or message.author.id not in authorized_ids:
-        return
-
-    # 2. Définir les conditions de déclenchement
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_mention = f'<@{client.user.id}>' in message.content or f'<@!{client.user.id}>' in message.content
     is_convo_mode = message.author.id in convo_mode_users and not is_dm
-
-    # 3. Si aucune condition n'est remplie, on arrête
-    if not (is_dm or is_mention or is_convo_mode):
+    
+    if not (is_dm or is_mention or is_convo_mode) or message.author == client.user or message.author.id not in authorized_ids:
         return
 
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Commande détectée par : {message.author.name}")
 
     try:
-        # On prépare le contenu de la commande en enlevant la mention si besoin
         if is_mention:
             command_content = message.content.replace(f'<@{client.user.id}>', '').replace(f'<@!{client.user.id}>', '').strip()
-        else: # En DM ou en mode convo, tout le message est la commande
+        else:
             command_content = message.content.strip()
 
         first_word = command_content.split()[0].lower() if command_content else ''
@@ -184,7 +163,7 @@ async def on_message(message):
             await message.reply("✅ Mode conversation activé. Je réagirai à tous vos messages dans ce salon. Dites `end-convo` pour arrêter.")
             return
         if first_word in ['end-convo', 'end-conversation']:
-            if is_dm: return # Commande inutile en DM
+            if is_dm: return
             convo_mode_users.discard(message.author.id)
             await message.reply("☑️ Mode conversation désactivé.")
             return
@@ -202,11 +181,18 @@ async def on_message(message):
                 await message.reply("🔥 Impossible de récupérer le contenu de cette page.")
                 return
             
-            model_name_display = "Perplexity (sonar)"
-            prompt_pplx = f"Voici le contenu d'une page web. Fais-en un résumé clair et concis en français.\n\n--- CONTENU ---\n{page_text}"
-            messages_pplx = [{"role": "system", "content": "You are a summarization expert."}, {"role": "user", "content": prompt_pplx}]
-            reponse_ia = pplx_client.chat.completions.create(model="sonar", messages=messages_pplx)
-            reponse_finale = reponse_ia.choices[0].message.content
+            # MODIFICATION : On utilise Gemini pour le résumé
+            next_api_key = next(key_cycler)
+            print(f"Utilisation de la clé API Gemini se terminant par ...{next_api_key[-4:]} pour le résumé d'URL.")
+            genai.configure(api_key=next_api_key)
+
+            model_name_display = "Gemini (gemini-1.5-flash)"
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            
+            prompt_gemini = f"Fais un résumé clair et concis en français du contenu de la page web suivante :\n\n--- CONTENU DE LA PAGE ---\n{page_text}"
+            
+            reponse_ia = await model.generate_content_async(prompt_gemini)
+            reponse_finale = reponse_ia.text
             
             message_final = f"**Résumé de l'URL :** {url}\n**Modèle utilisé :** `{model_name_display}`\n\n---\n\n{reponse_finale}"
             await send_long_message(message.channel, message_final, message_to_reply=message)
@@ -222,36 +208,67 @@ async def on_message(message):
                 await client.close()
                 sys.exit(0)
 
+            if command in ['r', 'purge']:
+                if len(cmd_parts) < 2 or not cmd_parts[1].isdigit():
+                    await message.reply("❌ Usage : `r [nombre]` (ex: `r 10`)")
+                    return
+                
+                amount_to_delete = int(cmd_parts[1])
+                if not 1 <= amount_to_delete <= 100:
+                    await message.reply("❌ Le nombre doit être entre 1 et 100.")
+                    return
+                
+                try:
+                    await message.delete()
+                except discord.Forbidden:
+                    print("Je n'ai pas la permission de supprimer le message de commande.")
+
+                messages_to_delete = []
+                async for msg in message.channel.history(limit=200):
+                    if msg.author == client.user:
+                        messages_to_delete.append(msg)
+                        if len(messages_to_delete) >= amount_to_delete:
+                            break
+                
+                if messages_to_delete:
+                    await message.channel.delete_messages(messages_to_delete)
+                return
+
             if command in ['add-whitelist', 'awl']:
                 if len(cmd_parts) < 2:
                     await message.reply("❌ Usage : `add-whitelist [@mention ou ID]`")
                     return
-                user_id_to_add = re.findall(r'\d+', cmd_parts[1])[0]
-                current_whitelist = os.getenv('WHITELIST_IDS', '').split(',')
-                current_whitelist = [uid for uid in current_whitelist if uid]
-                if user_id_to_add in current_whitelist:
-                    await message.reply(f"ℹ️ L'utilisateur `{user_id_to_add}` est déjà dans la whitelist.")
-                    return
-                current_whitelist.append(user_id_to_add)
-                if update_env_file('WHITELIST_IDS', ",".join(current_whitelist)):
-                    await message.reply(f"✅ L'utilisateur `{user_id_to_add}` a été ajouté. Redémarrez le script pour appliquer.")
-                else:
-                    await message.reply("🔥 Erreur lors de l'écriture dans le fichier .env.")
+                try:
+                    user_id_to_add = int(re.findall(r'\d+', cmd_parts[1])[0])
+                    current_authorized = [OWNER_ID_INT] + read_whitelist()
+                    if user_id_to_add in current_authorized:
+                        await message.reply(f"ℹ️ L'utilisateur `{user_id_to_add}` est déjà autorisé.")
+                        return
+                    add_to_whitelist(user_id_to_add)
+                    authorized_ids.append(user_id_to_add)
+                    await message.reply(f"✅ L'utilisateur `{user_id_to_add}` a été ajouté à la whitelist.")
+                except (IndexError, ValueError):
+                    await message.reply("❌ ID invalide.")
                 return
+
             if command in ['remove-whitelist', 'rwl']:
                 if len(cmd_parts) < 2:
                     await message.reply("❌ Usage : `remove-whitelist [@mention ou ID]`")
                     return
-                user_id_to_remove = re.findall(r'\d+', cmd_parts[1])[0]
-                current_whitelist = os.getenv('WHITELIST_IDS', '').split(',')
-                if user_id_to_remove not in current_whitelist:
-                    await message.reply(f"ℹ️ L'utilisateur `{user_id_to_remove}` n'est pas dans la whitelist.")
-                    return
-                current_whitelist.remove(user_id_to_remove)
-                if update_env_file('WHITELIST_IDS', ",".join(current_whitelist)):
-                    await message.reply(f"✅ L'utilisateur `{user_id_to_remove}` a été retiré. Redémarrez le script pour appliquer.")
-                else:
-                    await message.reply("🔥 Erreur lors de l'écriture dans le fichier .env.")
+                try:
+                    user_id_to_remove = int(re.findall(r'\d+', cmd_parts[1])[0])
+                    if user_id_to_remove == OWNER_ID_INT:
+                        await message.reply("❌ Vous ne pouvez pas vous retirer vous-même de la liste.")
+                        return
+                    current_authorized = [OWNER_ID_INT] + read_whitelist()
+                    if user_id_to_remove not in current_authorized:
+                        await message.reply(f"ℹ️ L'utilisateur `{user_id_to_remove}` n'est pas dans la whitelist.")
+                        return
+                    remove_from_whitelist(user_id_to_remove)
+                    if user_id_to_remove in authorized_ids: authorized_ids.remove(user_id_to_remove)
+                    await message.reply(f"✅ L'utilisateur `{user_id_to_remove}` a été retiré de la whitelist.")
+                except (IndexError, ValueError):
+                    await message.reply("❌ ID invalide.")
                 return
             
             if command in ['mem', 'memorise', 'mémorise']:
@@ -347,6 +364,11 @@ async def on_message(message):
         use_web = params.get('--web', 'non').lower() == 'oui'
         modele_gemini = params.get('--modele').strip('\'"')
 
+        if message.author.id == OWNER_ID_INT:
+            user_title = f"ton propriétaire, {message.author.display_name}"
+        else:
+            user_title = f"l'utilisateur autorisé, {message.author.display_name}"
+
         prompt_system = (
             "Tu es 'AI-Context', un assistant personnel. Tu as accès à trois types d'informations :\n"
             "1. Une mémoire à long terme avec des faits importants que ton propriétaire t'a demandés de retenir.\n"
@@ -358,14 +380,15 @@ async def on_message(message):
             "--- CONTEXTE DE LA CONVERSATION ---\n"
             f"{contexte_final if contexte_final else 'Aucun contexte fourni.'}\n"
             "--- FIN CONTEXTE ---\n\n"
-            f"Question de l'utilisateur ({message.author.display_name}) : {question}"
+            f"Question de {user_title} : {question}"
         )
 
         if use_web:
             model_name_pplx = "sonar"
             model_name_display = f"Perplexity ({model_name_pplx})"
             print(f"Utilisation du modèle Web Perplexity...")
-            messages_pplx = [{"role": "system", "content": prompt_system.replace("Tu es 'AI-Context'...", "You are a helpful AI assistant...")}, {"role": "user", "content": question}]
+            prompt_pplx = prompt_system.replace("Tu es 'AI-Context', un assistant personnel.", "You are a helpful AI assistant.")
+            messages_pplx = [{"role": "system", "content": "You are a helpful AI assistant that answers questions using web search and provided context."}, {"role": "user", "content": prompt_pplx}]
             reponse_ia_complete = pplx_client.chat.completions.create(model=model_name_pplx, messages=messages_pplx)
             reponse_finale = reponse_ia_complete.choices[0].message.content
             if hasattr(reponse_ia_complete, 'search_results') and reponse_ia_complete.search_results:
