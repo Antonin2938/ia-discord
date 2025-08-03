@@ -28,7 +28,9 @@ OWNER_ID = os.getenv('OWNER_ID')
 
 MEMORY_FILE = "memory.txt"
 WHITELIST_FILE = "whitelist.txt"
-convo_mode_users = set()
+# Dictionnaire pour stocker l'historique par salon, puis par utilisateur
+# Structure : { channel_id: { user_id: [messages] } }
+convo_history = {}
 
 if not all([DISCORD_TOKEN, GEMINI_API_KEYS, PPLX_API_KEY, OWNER_ID]):
     print("Erreur : Variables d'environnement manquantes.")
@@ -139,7 +141,7 @@ async def on_ready():
 async def on_message(message):
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_mention = f'<@{client.user.id}>' in message.content or f'<@!{client.user.id}>' in message.content
-    is_convo_mode = message.author.id in convo_mode_users and not is_dm
+    is_convo_mode = not is_dm and message.channel.id in convo_history and message.author.id in convo_history[message.channel.id]
     
     if not (is_dm or is_mention or is_convo_mode) or message.author == client.user or message.author.id not in authorized_ids:
         return
@@ -157,15 +159,18 @@ async def on_message(message):
         # --- GESTION DES COMMANDES SPÉCIALES ---
         if first_word in ['start-convo', 'start-conversation']:
             if is_dm:
-                await message.channel.send("Le mode conversation n'est pas nécessaire en message privé.")
+                await message.channel.send("Le mode conversation n'est pas disponible en message privé.")
                 return
-            convo_mode_users.add(message.author.id)
-            await message.reply("✅ Mode conversation activé. Je réagirai à tous vos messages dans ce salon. Dites `end-convo` pour arrêter.")
+            if message.channel.id not in convo_history:
+                convo_history[message.channel.id] = {}
+            convo_history[message.channel.id][message.author.id] = []
+            await message.reply("✅ Mémoire de conversation activée pour ce salon. Je me souviendrai de nos échanges. Dites `end-convo` pour oublier.")
             return
         if first_word in ['end-convo', 'end-conversation']:
             if is_dm: return
-            convo_mode_users.discard(message.author.id)
-            await message.reply("☑️ Mode conversation désactivé.")
+            if message.channel.id in convo_history:
+                convo_history[message.channel.id].pop(message.author.id, None)
+            await message.reply("☑️ Mémoire de conversation désactivée pour ce salon. J'ai oublié notre discussion.")
             return
 
         if first_word in ['resume-url', 'summarize-url']:
@@ -181,16 +186,11 @@ async def on_message(message):
                 await message.reply("🔥 Impossible de récupérer le contenu de cette page.")
                 return
             
-            # MODIFICATION : On utilise Gemini pour le résumé
             next_api_key = next(key_cycler)
-            print(f"Utilisation de la clé API Gemini se terminant par ...{next_api_key[-4:]} pour le résumé d'URL.")
             genai.configure(api_key=next_api_key)
-
             model_name_display = "Gemini (gemini-1.5-flash)"
             model = genai.GenerativeModel('gemini-1.5-flash')
-            
             prompt_gemini = f"Fais un résumé clair et concis en français du contenu de la page web suivante :\n\n--- CONTENU DE LA PAGE ---\n{page_text}"
-            
             reponse_ia = await model.generate_content_async(prompt_gemini)
             reponse_finale = reponse_ia.text
             
@@ -325,7 +325,7 @@ async def on_message(message):
         
         question = " ".join(question_parts).strip()
 
-        if not question:
+        if not question and not message.attachments:
             await message.reply("Salut ! Mentionne-moi avec une question ou utilise une commande spéciale.")
             return
 
@@ -340,23 +340,45 @@ async def on_message(message):
             destination = message.author
             message_to_reply = None
 
-        historique_brut = []
-        contexte_messages_str = params.get('--contexte_messages')
-        contexte_depuis_str = params.get('--contexte_depuis')
-        if contexte_depuis_str or contexte_messages_str:
-            limit = int(contexte_messages_str) if contexte_messages_str else None
-            after = dateparser.parse(contexte_depuis_str, settings={'PREFER_DATES_FROM': 'past', 'DATE_ORDER': 'DMY'}) if contexte_depuis_str else None
-            async for msg in message.channel.history(limit=limit, after=after, oldest_first=True if after else False):
-                historique_brut.append(msg)
-            if not after: historique_brut.reverse()
-        
-        if target_user_str:
-            target_user_id = re.findall(r'\d+', target_user_str)
-            if target_user_id:
-                target_user_id = int(target_user_id[0])
-                historique_brut = [msg for msg in historique_brut if msg.author.id == target_user_id]
-        
-        contexte_final = "\n".join([f"[{msg.created_at.strftime('%d/%m %H:%M')}] {msg.author.display_name}: {msg.content}" for msg in historique_brut if msg.id != message.id])
+        # --- NOUVEAU : LECTURE DES FICHIERS ATTACHÉS ---
+        file_context = ""
+        if message.attachments:
+            for attachment in message.attachments:
+                if attachment.filename.lower().endswith('.txt'):
+                    try:
+                        file_content_bytes = await attachment.read()
+                        file_content_str = file_content_bytes.decode('utf-8')
+                        file_context += f"\n--- CONTENU DU FICHIER '{attachment.filename}' ---\n"
+                        file_context += file_content_str
+                        file_context += f"\n--- FIN DU FICHIER '{attachment.filename}' ---\n"
+                        print(f"Fichier .txt '{attachment.filename}' lu et ajouté au contexte.")
+                    except Exception as e:
+                        print(f"Erreur lors de la lecture du fichier {attachment.filename}: {e}")
+                        await message.reply(f"Désolé, je n'ai pas pu lire le fichier `{attachment.filename}`.")
+
+        # --- LOGIQUE DE CONTEXTE AMÉLIORÉE ---
+        contexte_final = ""
+        if not is_dm and message.channel.id in convo_history and message.author.id in convo_history[message.channel.id]:
+            contexte_final = "\n".join(convo_history[message.channel.id][message.author.id])
+            print(f"Utilisation du contexte de conversation pour {message.author.name} dans le salon {message.channel.name}.")
+        else:
+            historique_brut = []
+            contexte_messages_str = params.get('--contexte_messages')
+            contexte_depuis_str = params.get('--contexte_depuis')
+            if contexte_depuis_str or contexte_messages_str:
+                limit = int(contexte_messages_str) if contexte_messages_str else None
+                after = dateparser.parse(contexte_depuis_str, settings={'PREFER_DATES_FROM': 'past', 'DATE_ORDER': 'DMY'}) if contexte_depuis_str else None
+                async for msg in message.channel.history(limit=limit, after=after, oldest_first=True if after else False):
+                    historique_brut.append(msg)
+                if not after: historique_brut.reverse()
+            
+            if target_user_str:
+                target_user_id = re.findall(r'\d+', target_user_str)
+                if target_user_id:
+                    target_user_id = int(target_user_id[0])
+                    historique_brut = [msg for msg in historique_brut if msg.author.id == target_user_id]
+            
+            contexte_final = "\n".join([f"[{msg.created_at.strftime('%d/%m %H:%M')}] {msg.author.display_name}: {msg.content}" for msg in historique_brut if msg.id != message.id])
         
         reponse_finale = ""
         model_name_display = ""
@@ -369,25 +391,29 @@ async def on_message(message):
         else:
             user_title = f"l'utilisateur autorisé, {message.author.display_name}"
 
+        # NOUVEAU : Le prompt système inclut maintenant le contenu des fichiers
         prompt_system = (
-            "Tu es 'AI-Context', un assistant personnel. Tu as accès à trois types d'informations :\n"
-            "1. Une mémoire à long terme avec des faits importants que ton propriétaire t'a demandés de retenir.\n"
-            "2. Un contexte de conversation récent.\n"
-            "3. La question actuelle de l'utilisateur.\n\n"
+            "Tu es 'AI-Context', un assistant personnel. Tu as accès à plusieurs types d'informations pour répondre à la question :\n"
+            "1. Une mémoire à long terme avec des faits importants.\n"
+            "2. Le contenu d'un ou plusieurs fichiers texte fournis par l'utilisateur.\n"
+            "3. Un contexte de conversation récent.\n\n"
             "--- MÉMOIRE À LONG TERME ---\n"
             f"{long_term_memory if long_term_memory else 'Aucune information en mémoire.'}\n"
             "--- FIN MÉMOIRE ---\n\n"
+            "--- CONTENU DES FICHIERS ATTACHÉS ---\n"
+            f"{file_context if file_context else 'Aucun fichier .txt fourni.'}\n"
+            "--- FIN DES FICHIERS ---\n\n"
             "--- CONTEXTE DE LA CONVERSATION ---\n"
             f"{contexte_final if contexte_final else 'Aucun contexte fourni.'}\n"
             "--- FIN CONTEXTE ---\n\n"
-            f"Question de {user_title} : {question}"
+            f"Question de {user_title} : {question if question else 'Analyse le(s) document(s) fourni(s) et fais-en un résumé pertinent.'}"
         )
 
         if use_web:
             model_name_pplx = "sonar"
             model_name_display = f"Perplexity ({model_name_pplx})"
             print(f"Utilisation du modèle Web Perplexity...")
-            prompt_pplx = prompt_system.replace("Tu es 'AI-Context', un assistant personnel.", "You are a helpful AI assistant.")
+            prompt_pplx = prompt_system.replace("Tu es 'AI-Context'...", "You are a helpful AI assistant...")
             messages_pplx = [{"role": "system", "content": "You are a helpful AI assistant that answers questions using web search and provided context."}, {"role": "user", "content": prompt_pplx}]
             reponse_ia_complete = pplx_client.chat.completions.create(model=model_name_pplx, messages=messages_pplx)
             reponse_finale = reponse_ia_complete.choices[0].message.content
@@ -403,7 +429,12 @@ async def on_message(message):
             reponse_ia = await model.generate_content_async(prompt_system)
             reponse_finale = reponse_ia.text
         
-        message_final = f"**Question :** {question}\n**Modèle utilisé :** `{model_name_display}`\n\n---\n\n{reponse_finale}"
+        # Mise à jour de l'historique de conversation par salon
+        if not is_dm and message.channel.id in convo_history and message.author.id in convo_history[message.channel.id]:
+            convo_history[message.channel.id][message.author.id].append(f"Utilisateur ({message.author.display_name}): {question}")
+            convo_history[message.channel.id][message.author.id].append(f"Assistant (AI-Context): {reponse_finale}")
+
+        message_final = f"**Question :** {question or 'Analyse de document'}\n**Modèle utilisé :** `{model_name_display}`\n\n---\n\n{reponse_finale}"
 
         await send_long_message(destination, message_final, message_to_reply=message)
         print("Réponse envoyée avec succès.")
